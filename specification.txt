@@ -1,0 +1,8 @@
+Universal Binary v1.0.0 Specification
+
+0x00 - 0x02 = Magic Header  (42 4E 00)
+0x03 - 0x06 = Signature (3A 94 71 DA)
+0x07 - 0x0A = Payload Length (uint32)
+0x0B - N = Binary Payload (compiled assembly)
+N+1 - M-2 = Extra bytes (optional, footer must be 2F 8A)
+M-1 - M = Footer (6C 0E if no extra bytes)
