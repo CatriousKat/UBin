@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -20,7 +20,7 @@ const (
 var expectedSignature = []byte{0x3A, 0x94, 0x71, 0xDA}
 
 func runubin(fileData []byte) {
-	if len(fileData) < 13 {
+	if len(fileData) < 19 {
 		log.Fatalf("Error: Invalid .ubin file: File is too small.")
 	}
 
@@ -32,14 +32,24 @@ func runubin(fileData []byte) {
 		log.Fatalf("Error: Invalid .ubin signature.")
 	}
 
-	payloadLen := binary.LittleEndian.Uint32(fileData[7:11])
-	if uint64(11)+uint64(payloadLen)+uint64(2) > uint64(len(fileData)) {
-		log.Fatalf("Error: Malformed .ubin file: Payload length exceeds available file size.")
-	}
+	offset := 7
 
-	execCode := fileData[11 : 11+payloadLen]
+	winLen := binary.LittleEndian.Uint32(fileData[offset : offset+4])
+	offset += 4
+	winCode := fileData[offset : offset+int(winLen)]
+	offset += int(winLen)
+
+	macLen := binary.LittleEndian.Uint32(fileData[offset : offset+4])
+	offset += 4
+	macCode := fileData[offset : offset+int(macLen)]
+	offset += int(macLen)
+
+	linuxLen := binary.LittleEndian.Uint32(fileData[offset : offset+4])
+	offset += 4
+	linuxCode := fileData[offset : offset+int(linuxLen)]
+	offset += int(linuxLen)
+
 	footer := fileData[len(fileData)-2:]
-
 	validStandard := (footer[0] == 0x6C && footer[1] == 0x0E)
 	validExtra := (footer[0] == 0x2F && footer[1] == 0x8A)
 
@@ -47,26 +57,34 @@ func runubin(fileData []byte) {
 		log.Fatalf("Error: Invalid storage option footer.")
 	}
 
+	var targetCode []byte
 	var targetDir string
 	fileExt := ""
 
 	switch runtime.GOOS {
 	case "windows":
+		targetCode = winCode
 		targetDir = os.Getenv("TEMP")
 		if targetDir == "" {
 			targetDir = os.TempDir()
 		}
 		fileExt = ".exe"
-	case "linux":
-		targetDir = "/tmp"
 	case "darwin":
+		targetCode = macCode
 		home, err := os.UserHomeDir()
 		if err != nil {
 			log.Fatalf("Error getting user home directory: %v", err)
 		}
 		targetDir = filepath.Join(home, "Library", "Caches")
+	case "linux":
+		targetCode = linuxCode
+		targetDir = "/tmp"
 	default:
 		log.Fatalf("Error: Unsupported operating system: %s", runtime.GOOS)
+	}
+
+	if len(targetCode) == 0 {
+		log.Fatalf("Error: No binary embedded in this .ubin container for OS: %s", runtime.GOOS)
 	}
 
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -82,7 +100,7 @@ func runubin(fileData []byte) {
 	defer os.Remove(tmpPath)
 
 	if validExtra {
-		extraStart := 11 + int(payloadLen)
+		extraStart := offset
 		extraEnd := len(fileData) - 2
 		if extraStart < extraEnd {
 			extraBytes := fileData[extraStart:extraEnd]
@@ -92,7 +110,7 @@ func runubin(fileData []byte) {
 		}
 	}
 
-	err = os.WriteFile(tmpPath, execCode, 0755)
+	err = os.WriteFile(tmpPath, targetCode, 0755)
 	if err != nil {
 		log.Fatalf("Error writing temporary executable: %v", err)
 	}
@@ -109,57 +127,67 @@ func runubin(fileData []byte) {
 }
 
 func main() {
-	compilerPtr := flag.String("compiler", "", "Path to binary file")
-	extraBytesPtr := flag.String("extrabytes", "", "Path to extra bytes file")
-	getExtraPtr := flag.String("getextra", "", "Path to .ubin file to extract extra bytes from")
-	outputPtr := flag.String("o", "output.ubin", "Output file path")
-
-	flag.Parse()
-
-	if *getExtraPtr != "" {
-		fileData, err := os.ReadFile(*getExtraPtr)
-		if err != nil {
-			log.Fatalf("Error reading file: %v", err)
-		}
-		if len(fileData) < 15 {
-			log.Fatalf("Error: File is too small.")
-		}
-
-		footer := fileData[len(fileData)-2:]
-		if footer[0] != 0x2F || footer[1] != 0x8A {
-			log.Fatalf("Error: .ubin file does not contain extra bytes.")
-		}
-
-		payloadLen := binary.LittleEndian.Uint32(fileData[7:11])
-		extraStart := 11 + int(payloadLen)
-		extraEnd := len(fileData) - 2
-
-		if extraStart >= extraEnd {
-			log.Fatalf("Error: Malformed extra bytes section.")
-		}
-
-		err = os.WriteFile(*outputPtr, fileData[extraStart:extraEnd], 0644)
-		if err != nil {
-			log.Fatalf("Error writing extracted extra bytes: %v", err)
-		}
-		return
+	args := os.Args[1:]
+	if len(args) == 0 {
+		log.Fatalf("Error: No arguments provided.")
 	}
 
-	if *compilerPtr != "" {
-		if _, err := os.Stat(*compilerPtr); os.IsNotExist(err) {
-			log.Fatalf("Error: Source file does not exist.")
+	isCompiler := false
+	var binaries []string
+	extraBytesPath := ""
+	outputPath := "output.ubin"
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--compiler":
+			isCompiler = true
+			// Collect the next 3 arguments strictly as binary paths
+			for j := 0; j < 3; j++ {
+				if i+1 < len(args) {
+					binaries = append(binaries, args[i+1])
+					i++
+				}
+			}
+		case "--extrabytes":
+			if i+1 < len(args) {
+				extraBytesPath = args[i+1]
+				i++
+			}
+		case "-o":
+			if i+1 < len(args) {
+				outputPath = args[i+1]
+				i++
+			}
+		default:
+			if !isCompiler {
+				binaries = append(binaries, args[i])
+			}
+		}
+	}
+
+	if isCompiler {
+		if len(binaries) < 3 {
+			log.Fatalf("Error: --compiler requires exactly 3 binary paths: <winbin> <macbin> <linuxbin>")
 		}
 
-		code, err := os.ReadFile(*compilerPtr)
+		winBytes, err := os.ReadFile(binaries[0])
 		if err != nil {
-			log.Fatalf("Error reading source file: %v", err)
+			log.Fatalf("Error reading Windows binary (%s): %v", binaries[0], err)
+		}
+		macBytes, err := os.ReadFile(binaries[1])
+		if err != nil {
+			log.Fatalf("Error reading macOS binary (%s): %v", binaries[1], err)
+		}
+		linuxBytes, err := os.ReadFile(binaries[2])
+		if err != nil {
+			log.Fatalf("Error reading Linux binary (%s): %v", binaries[2], err)
 		}
 
 		var extra []byte
 		footer := []byte{0x6C, 0x0E}
 
-		if *extraBytesPtr != "" {
-			extra, err = os.ReadFile(*extraBytesPtr)
+		if extraBytesPath != "" {
+			extra, err = os.ReadFile(extraBytesPath)
 			if err != nil {
 				log.Fatalf("Error reading extra bytes file: %v", err)
 			}
@@ -174,28 +202,37 @@ func main() {
 		buffer.Write(expectedSignature)
 
 		lenBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(lenBytes, uint32(len(code)))
-		buffer.Write(lenBytes)
 
-		buffer.Write(code)
+		binary.LittleEndian.PutUint32(lenBytes, uint32(len(winBytes)))
+		buffer.Write(lenBytes)
+		buffer.Write(winBytes)
+
+		binary.LittleEndian.PutUint32(lenBytes, uint32(len(macBytes)))
+		buffer.Write(lenBytes)
+		buffer.Write(macBytes)
+
+		binary.LittleEndian.PutUint32(lenBytes, uint32(len(linuxBytes)))
+		buffer.Write(lenBytes)
+		buffer.Write(linuxBytes)
+
 		if len(extra) > 0 {
 			buffer.Write(extra)
 		}
 		buffer.Write(footer)
 
-		err = os.WriteFile(*outputPtr, buffer.Bytes(), 0644)
+		err = os.WriteFile(outputPath, buffer.Bytes(), 0644)
 		if err != nil {
 			log.Fatalf("Error writing output file: %v", err)
 		}
+		fmt.Printf("Successfully compiled multi-platform container to %s\n", outputPath)
 		return
 	}
 
-	args := flag.Args()
-	if len(args) < 1 {
+	if len(binaries) == 0 {
 		log.Fatalf("Error: No .ubin file specified for execution.")
 	}
 
-	targetFile := args[0]
+	targetFile := binaries[0]
 	fileData, err := os.ReadFile(targetFile)
 	if err != nil {
 		log.Fatalf("Error reading target file: %v", err)
