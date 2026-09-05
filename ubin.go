@@ -19,6 +19,21 @@ const (
 
 var expectedSignature = []byte{0x3A, 0x94, 0x71, 0xDA}
 
+func getextra(fileData []byte, offset int) []byte {
+	extraStart := offset
+	extraEnd := len(fileData) - 2
+	if extraStart >= extraEnd {
+		return nil
+	}
+
+	extraBytes := fileData[extraStart:extraEnd]
+	if len(extraBytes) > 512 {
+		log.Fatalf("Error: Invalid .ubin container: Extra bytes exceed 512-byte limit (%d bytes found).", len(extraBytes))
+	}
+
+	return extraBytes
+}
+
 func runubin(fileData []byte) {
 	if len(fileData) < 19 {
 		log.Fatalf("Error: Invalid .ubin file: File is too small.")
@@ -100,10 +115,8 @@ func runubin(fileData []byte) {
 	defer os.Remove(tmpPath)
 
 	if validExtra {
-		extraStart := offset
-		extraEnd := len(fileData) - 2
-		if extraStart < extraEnd {
-			extraBytes := fileData[extraStart:extraEnd]
+		extraBytes := getextra(fileData, offset)
+		if len(extraBytes) > 0 {
 			txtPath := tmpPath + ".txt"
 			defer os.Remove(txtPath)
 			_ = os.WriteFile(txtPath, extraBytes, 0644)
@@ -133,7 +146,9 @@ func main() {
 	}
 
 	isCompiler := false
+	isGetExtra := false
 	var binaries []string
+	ubinPath := ""
 	extraBytesPath := ""
 	outputPath := "output.ubin"
 
@@ -141,12 +156,17 @@ func main() {
 		switch args[i] {
 		case "--compiler":
 			isCompiler = true
-			// Collect the next 3 arguments strictly as binary paths
 			for j := 0; j < 3; j++ {
 				if i+1 < len(args) {
 					binaries = append(binaries, args[i+1])
 					i++
 				}
+			}
+		case "--getextra":
+			isGetExtra = true
+			if i+1 < len(args) {
+				ubinPath = args[i+1]
+				i++
 			}
 		case "--extrabytes":
 			if i+1 < len(args) {
@@ -159,10 +179,63 @@ func main() {
 				i++
 			}
 		default:
-			if !isCompiler {
+			if !isCompiler && !isGetExtra {
 				binaries = append(binaries, args[i])
 			}
 		}
+	}
+
+	if isGetExtra {
+		if ubinPath == "" {
+			log.Fatalf("Error: --getextra requires a .ubin container path.")
+		}
+
+		fileData, err := os.ReadFile(ubinPath)
+		if err != nil {
+			log.Fatalf("Error reading target file: %v", err)
+		}
+
+		if len(fileData) < 19 {
+			log.Fatalf("Error: Invalid .ubin file: File is too small.")
+		}
+
+		if fileData[0] != magicHeader1 || fileData[1] != magicHeader2 || fileData[2] != nullByte {
+			log.Fatalf("Error: Invalid .ubin magic header bytes.")
+		}
+
+		if !bytes.Equal(fileData[3:7], expectedSignature) {
+			log.Fatalf("Error: Invalid .ubin signature.")
+		}
+
+		offset := 7
+		for b := 0; b < 3; b++ {
+			if offset+4 > len(fileData) {
+				log.Fatalf("Error: Invalid .ubin file layout.")
+			}
+			length := binary.LittleEndian.Uint32(fileData[offset : offset+4])
+			offset += 4
+			offset += int(length)
+		}
+
+		footer := fileData[len(fileData)-2:]
+		validExtra := (footer[0] == 0x2F && footer[1] == 0x8A)
+
+		if !validExtra {
+			log.Fatalf("Error: This .ubin container does not contain extra bytes.")
+		}
+
+		extraBytes := getextra(fileData, offset)
+		if len(extraBytes) == 0 {
+			log.Fatalf("Error: No extra bytes found in container.")
+		}
+
+		err = os.WriteFile(outputPath, extraBytes, 0644)
+		if err != nil {
+			log.Fatalf("Error writing output file: %v", err)
+		}
+
+		fmt.Printf("Successfully extracted extra bytes to %s\n", outputPath)
+		return
 	}
 
 	if isCompiler {
@@ -224,7 +297,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error writing output file: %v", err)
 		}
-		fmt.Printf("Successfully compiled multi-platform container to %s\n", outputPath)
+		fmt.Printf("Successfully compiled UBin to %s\n", outputPath)
 		return
 	}
 
